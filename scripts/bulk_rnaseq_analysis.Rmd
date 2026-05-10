@@ -1,0 +1,637 @@
+---
+title: "Bulk RNA Seq Analysis Workflow"
+author: "Patandeen Mishra"
+date: "2026-05-10"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Bulk RNA-Seq Analysis Workflow
+
+This workflow demonstrates preprocessing, batch correction, PCA analysis, differential expression analysis, and pathway enrichment analysis using bulk RNA-Seq data.
+
+---
+
+## Load Libraries and Import Data
+
+```{r}
+library(tidyverse)
+
+# Read metadata and raw count matrix
+metadata <- read.csv("data/metadata.csv")
+raw_counts <- read.csv("data/ileum_raw_counts.csv", check.names = FALSE, row.names = 1)
+
+# Check dimensions
+metadata
+dim(metadata)
+dim(raw_counts)
+
+# Ensure unique gene names
+rownames(raw_counts) <- make.unique(rownames(raw_counts))
+
+# Keep only protein-coding genes
+protein_coding_genes <- read_lines("data/pc_gene.txt")
+raw_counts <- raw_counts[rownames(raw_counts) %in% protein_coding_genes, ]
+
+# Match sample order between metadata and count matrix
+metadata <- metadata[metadata$Sample %in% colnames(raw_counts), ]
+metadata <- metadata[match(colnames(raw_counts), metadata$Sample), ]
+
+# Confirm sample order
+all(metadata$Sample == colnames(raw_counts))
+```
+
+---
+
+## Handle Missing Values
+
+```{r}
+# Replace missing and non-finite values with zero
+raw_counts[is.na(raw_counts)] <- 0
+raw_counts[!is.finite(as.matrix(raw_counts))] <- 0
+
+# Calculate percentage of missing genes per sample
+sample_missing_pct <- colSums(raw_counts == 0) / nrow(raw_counts)
+
+missing_df <- data.frame(
+  Sample = colnames(raw_counts),
+  Missing_Percentage = sample_missing_pct[colnames(raw_counts)]
+)
+
+# Save missing value statistics
+write.csv(missing_df, "results/Percentage_of_missing_genes_per_samples.csv")
+
+# Plot missing value distribution
+png("figures/Histogram_percentage_of_missing_values_per_samples.png",
+    width = 10, height = 8, units = 'in', res = 300)
+
+hist(missing_df$Missing_Percentage,
+     main = "Missing Genes per Sample",
+     xlab = "Fraction Missing")
+
+dev.off()
+
+# Save cleaned raw matrix
+write.csv(raw_counts, "results/raw_merged.csv")
+```
+
+---
+
+## Batch Correction Using limma
+
+```{r}
+library(limma)
+
+# Reorder metadata to match count matrix
+metadata <- metadata[match(colnames(raw_counts), metadata$Sample), ]
+
+# Confirm matching sample order
+stopifnot(all(metadata$Sample == colnames(raw_counts)))
+
+# Define batch and design matrix
+metadata$Batch <- as.factor(metadata$Batch)
+mod <- model.matrix(~ Condition, data = metadata)
+
+# Perform batch correction
+batch_corrected_counts <- removeBatchEffect(
+  as.matrix(raw_counts),
+  batch = metadata$Batch,
+  design = mod
+)
+```
+
+---
+
+## Remove Unwanted Batches
+
+```{r}
+# Inspect batch distribution
+print(table(metadata$Batch, metadata$Condition))
+
+# Remove selected batches
+exclude <- c("GSE183620", "GSE193677")
+
+metadata$Batch <- droplevels(metadata$Batch)
+metadata <- metadata[!metadata$Batch %in% exclude, ]
+raw_counts <- raw_counts[, colnames(raw_counts) %in% metadata$Sample]
+
+# Reorder metadata
+metadata <- metadata[match(colnames(raw_counts), metadata$Sample), ]
+metadata$Batch <- as.factor(metadata$Batch)
+
+# Re-run batch correction
+mod <- model.matrix(~ Condition, data = metadata)
+
+batch_corrected_counts <- removeBatchEffect(
+  as.matrix(raw_counts),
+  batch = metadata$Batch,
+  design = mod
+)
+
+# Save corrected matrix
+write.csv(batch_corrected_counts, "results/limma_merged.csv")
+```
+
+---
+
+## Principal Component Analysis (PCA)
+
+```{r}
+library(ggplot2)
+
+# PCA before batch correction
+raw_counts <- raw_counts[apply(raw_counts, 1, var) > 0, ]
+
+pca_before <- prcomp(t(raw_counts), scale. = TRUE)
+
+pca_before_df <- data.frame(
+  pca_before$x,
+  Condition = metadata$Condition,
+  Batch = metadata$Batch
+)
+
+var_explained_before <- round(
+  100 * (pca_before$sdev^2 / sum(pca_before$sdev^2)),
+  2
+)
+
+# PCA after batch correction
+batch_corrected_counts <- batch_corrected_counts[
+  apply(batch_corrected_counts, 1, var) > 0,
+]
+
+pca_after <- prcomp(t(batch_corrected_counts), scale. = TRUE)
+
+pca_after_df <- data.frame(
+  pca_after$x,
+  Condition = metadata$Condition,
+  Batch = metadata$Batch
+)
+
+var_explained_after <- round(
+  100 * (pca_after$sdev^2 / sum(pca_after$sdev^2)),
+  2
+)
+
+# PCA plotting function by condition
+plot_pca_condition <- function(pca_df, var_exp, title) {
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = Condition)) +
+    geom_point(size = 3, alpha = 0.8) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = title,
+      x = paste0("PC1 (", var_exp[1], "%)"),
+      y = paste0("PC2 (", var_exp[2], "%)")
+    )
+}
+
+# PCA plotting function by batch
+plot_pca_batch <- function(pca_df, var_exp, title) {
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = Batch)) +
+    geom_point(size = 3, alpha = 0.8) +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = title,
+      x = paste0("PC1 (", var_exp[1], "%)"),
+      y = paste0("PC2 (", var_exp[2], "%)")
+    )
+}
+
+# Generate PCA plots
+p1 <- plot_pca_batch(
+  pca_before_df,
+  var_explained_before,
+  "PCA Before Batch Correction"
+)
+
+p2 <- plot_pca_batch(
+  pca_after_df,
+  var_explained_after,
+  "PCA After Batch Correction"
+)
+
+p3 <- plot_pca_condition(
+  pca_before_df,
+  var_explained_before,
+  "PCA Before Correction - Condition"
+)
+
+p4 <- plot_pca_condition(
+  pca_after_df,
+  var_explained_after,
+  "PCA After Correction - Condition"
+)
+
+# Save PCA plots
+ggsave("figures/PCA_before_Batch.png", p1, width = 8, height = 6, dpi = 300)
+ggsave("figures/PCA_after_Batch.png", p2, width = 8, height = 6, dpi = 300)
+ggsave("figures/PCA_before_Condition.png", p3, width = 8, height = 6, dpi = 300)
+ggsave("figures/PCA_after_Condition.png", p4, width = 8, height = 6, dpi = 300)
+```
+
+---
+
+# Differential Expression Analysis
+
+## Load Required Libraries
+
+```{r}
+library(limma)
+library(edgeR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(ggplot2)
+library(tibble)
+library(readr)
+```
+
+---
+
+## Load Batch-Corrected Data
+
+```{r}
+# Read corrected count matrix
+ileum_data <- read.csv("results/limma_merged.csv", row.names = 1)
+
+# Match samples with metadata
+ileum_data <- ileum_data[, colnames(ileum_data) %in% metadata$Sample]
+
+# Check dimensions
+dim(ileum_data)
+```
+
+---
+
+## Create Design Matrix
+
+```{r}
+# Define experimental groups
+group <- factor(metadata$Condition)
+
+# Create design matrix
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
+```
+
+---
+
+## Differential Gene Expression Analysis
+
+```{r}
+# Fit linear model
+fit <- lmFit(ileum_data, design)
+
+# Define contrasts
+contrast.matrix <- makeContrasts(
+  DiseaseUntreated_vs_Healthy = UC_No - Healthy,
+  levels = design
+)
+
+# Apply contrasts and empirical Bayes
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+
+# Extract DEG results
+top_genes <- topTable(fit2, adjust = "fdr", number = Inf)
+
+# Save DEG table
+write.csv(top_genes, "results/DEGsList.csv")
+
+# Filter significant genes
+DEGs <- top_genes[top_genes$adj.P.Val < 0.05, ]
+
+# DEG summary statistics
+total_DEGs <- nrow(DEGs)
+upregulated <- sum(DEGs$logFC > 0)
+downregulated <- sum(DEGs$logFC < 0)
+
+cat(
+  "At FDR < 0.05 - Total DEGs:",
+  total_DEGs,
+  "; Upregulated:",
+  upregulated,
+  "; Downregulated:",
+  downregulated,
+  "\n"
+)
+```
+
+---
+
+## PCA Visualization for DEG Analysis
+
+```{r}
+library(factoextra)
+
+# Perform PCA on corrected data
+pca_res <- prcomp(t(ileum_data), scale. = FALSE)
+
+qq <- fviz_pca_ind(
+  pca_res,
+  label = "none",
+  habillage = metadata$Condition,
+  addEllipses = FALSE,
+  mean.point = FALSE,
+  title = "UC vs Healthy",
+  pointsize = 3
+) +
+  theme_minimal(base_size = 15)
+
+# Save PCA plot
+png("figures/contrastPCA.png",
+    width = 7,
+    height = 5,
+    units = 'in',
+    res = 300)
+
+plot(qq)
+dev.off()
+```
+
+---
+
+## Volcano Plot Visualization
+
+```{r}
+library(ggrepel)
+
+# Genes of interest
+highlightgenes <- c(
+  "REG1A",
+  "FDFT1",
+  "SIK1",
+  "DMBT1",
+  "GGACT",
+  "DUSP21"
+)
+
+# Assign significance categories
+top_genes$Legend_Category <- "Not significant"
+
+top_genes$Legend_Category[
+  top_genes$adj.P.Val < 0.05
+] <- "Significant"
+
+top_genes$Legend_Category[
+  rownames(top_genes) %in% highlightgenes &
+    top_genes$adj.P.Val < 0.05
+] <- "Reported in Papers"
+
+# Define colors
+legend_colors <- c(
+  "Reported in Papers" = "red",
+  "Significant" = "#1e90ff",
+  "Not significant" = "grey"
+)
+
+# Label selected genes
+label_df <- top_genes[
+  rownames(top_genes) %in% highlightgenes &
+    top_genes$adj.P.Val < 0.05,
+]
+# Reorder so "Highlighted in Paper" come last
+top_genes$Legend_Category <- factor(top_genes$Legend_Category,
+                                    levels = c("Not significant", "Significant", "Reported in Papers"))
+
+# Generate volcano plot
+volcano_plot <- ggplot(top_genes, aes(x = logFC, y = -log10(adj.P.Val),color = Legend_Category)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  scale_color_manual(values = legend_colors) +
+  geom_vline(xintercept = c(0, 0), linetype = "dashed", color = "grey") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_text_repel(data = label_df,
+                  aes(label = rownames(label_df)),
+                  color = "black", size = 2.5,
+                  box.padding = 0.4, point.padding = 0.3,
+                  max.overlaps = 20, show.legend = FALSE) +
+#  scale_x_continuous(limits = c(-3, 5)) +
+  theme_minimal() +
+  labs(title = "UC vs Healthy",
+       x = "log2 Fold Change",
+       y = "-log10 Adjusted P value",
+       color = "Legend") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 11),
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+# Save volcano plot
+ggsave(
+  filename = "figures/VolcanoPlot.png",
+  plot = volcano_plot,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+```
+
+---
+
+## Reactome Pathway Enrichment Analysis
+
+```{r}
+# Prepare ranked gene list
+res <- top_genes
+
+# Convert gene symbols to ENTREZ IDs
+ncbi_list <- clusterProfiler::bitr(
+  rownames(res),
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+res$names <- rownames(res)
+
+res_mapped <- res %>%
+  left_join(ncbi_list, by = c("names" = "SYMBOL")) %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(ENTREZID, .keep_all = TRUE)  # remove duplicates
+
+# Create ranked gene vector (logFC)
+ngenes <- res_mapped$logFC
+names(ngenes) <- res_mapped$ENTREZID
+ngenes <- sort(ngenes, decreasing = TRUE)
+
+# Run Reactome GSEA
+enp_gsea <- gsePathway(
+  geneList = ngenes,
+  organism = "human",
+  verbose = FALSE
+)
+
+# Convert IDs to readable gene names
+enp_gsea <- setReadable(
+  enp_gsea,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID"
+)
+
+# Extract pathway results
+pathways <- enp_gsea@result %>%
+  arrange(p.adjust)
+
+# Select top pathways
+top_pathways <- pathways %>%
+  arrange(desc(abs(NES)))
+
+# Plot Top 20 Reactome Pathways
+top_pathways$Description <- str_wrap(
+  top_pathways$Description,
+  width = 50
+)
+
+top_pathways <- top_pathways[1:20, ] %>%
+  mutate(Description = fct_reorder(Description, NES))
+
+# Generate pathway enrichment plot
+ggplot(top_pathways, aes(x = NES, y = Description, color = p.adjust, size = setSize)) +
+  geom_point(alpha = 0.9) +
+  scale_color_gradient(low = "#0072B2", high = "#D55E00", name = "FDR (p.adjust)") +
+  scale_size(range = c(3, 10), name = "Gene Set Size") +
+  labs(
+    title = "Top 20 Reactome Pathways",
+    x = "Normalized Enrichment Score",
+    y = NULL
+    ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 10, color = "black", face = "plain"),
+    axis.text.x = element_text(size = 11),
+    plot.title = element_text(size = 15, face = "plain", hjust = 0.5),
+    plot.subtitle = element_text(size = 13, hjust = 0.5),
+    plot.caption = element_text(size = 10, face = "italic", hjust = 0.5),
+    legend.title = element_text(size = 12, face = "plain"),
+    legend.text = element_text(size = 11)
+  )
+
+# Save pathway enrichment plot
+ggsave(
+  "figures/pathwaysplot.png",
+  plot = pathway_plot,
+  width = 8,
+  height = 6
+)
+
+# Save pathway results
+write.csv(pathways, "results/pathways.csv")
+```
+
+## DESeq2 Differential Expression Analysis
+
+```{r}
+library(DESeq2)
+
+# Read metadata and raw count matrix
+metadata <- read.csv("data/metadata.csv")
+raw_counts <- read.csv(
+  "data/ileum_raw_counts.csv",
+  check.names = FALSE,
+  row.names = 1
+)
+
+# Check dimensions
+dim(metadata)
+dim(raw_counts)
+
+# Ensure unique gene names
+rownames(raw_counts) <- make.unique(rownames(raw_counts))
+
+# Keep only protein-coding genes
+protein_coding_genes <- read_lines("data/pc_gene.txt")
+
+raw_counts <- raw_counts[
+  rownames(raw_counts) %in% protein_coding_genes,
+]
+
+# Remove confounded datasets
+metadata <- metadata[
+  !metadata$Batch %in% c("GSE183620", "GSE193677"),
+]
+
+# Keep matching samples only
+raw_counts <- raw_counts[
+  ,
+  colnames(raw_counts) %in% metadata$Sample
+]
+
+# Reorder metadata
+metadata <- metadata[
+  match(colnames(raw_counts), metadata$Sample),
+]
+
+# Confirm sample order
+all(metadata$Sample == colnames(raw_counts))
+
+# Define condition factor
+metadata$Condition <- factor(metadata$Condition)
+metadata$Condition <- relevel(
+  metadata$Condition,
+  ref = "Healthy"
+)
+
+# Define batch factor
+metadata$Batch <- factor(metadata$Batch)
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = round(raw_counts),
+  colData = metadata,
+  design = ~ Batch + Condition
+)
+
+# Remove low-count genes
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Extract differential expression results
+res <- results(
+  dds,
+  contrast = c("Condition", "UC_No", "Healthy")
+)
+
+# Order results by adjusted p-value
+res <- res[order(res$padj), ]
+
+# Convert to dataframe
+res_df <- as.data.frame(res)
+
+# Save DEG results
+write.csv(
+  res_df,
+  "results/DESeq2_UC_vs_Healthy_results.csv"
+)
+
+# Count significant DEGs
+upregulated_genes <- sum(
+  res_df$log2FoldChange > 0 &
+    res_df$padj < 0.05,
+  na.rm = TRUE
+)
+
+downregulated_genes <- sum(
+  res_df$log2FoldChange < 0 &
+    res_df$padj < 0.05,
+  na.rm = TRUE
+)
+
+# Print DEG summary
+cat("Upregulated genes:", upregulated_genes, "\n")
+cat("Downregulated genes:", downregulated_genes, "\n")
+```
+---
+  
+## Summary
+
+This workflow demonstrates preprocessing, batch correction, PCA analysis, differential expression analysis, and pathway enrichment analysis for bulk RNA-Seq data using R.
